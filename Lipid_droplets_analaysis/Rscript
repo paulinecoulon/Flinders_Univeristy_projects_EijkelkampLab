@@ -1,0 +1,1181 @@
+#### =============================== Section 1: Data loading ===============================
+
+library(readxl)
+library(data.table)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(statmod)
+library(gridExtra)
+library(RColorBrewer)
+library(FSA)
+library(stats)
+library(broom)
+library(rstatix)  # Added for pairwise tests
+
+
+####### =============================== Section 2: Import data  ===============================
+### load all .csv files
+files <- list.files(path = "data", pattern = "\\.csv$", full.names = TRUE)
+#files <- list.files(pattern = "*.csv$")
+
+##### make one table for all data
+all_data <- files %>%
+  lapply(read.csv, stringsAsFactors = FALSE) %>%
+  bind_rows(.id = "source_file")
+
+
+all_data <- all_data %>%
+  mutate(
+    BioLabel = sub("_[0-9]+\\..*", "", Label),
+    Oil_type = case_when(
+      grepl("^(LD|LDAB|LDABD|LDFIX|LDFIX[0-9]+)_.*Fmix", Label) ~ "Fish Oil",
+      grepl("^LD", Label) ~ "Lard",
+      grepl("^Ca", Label) ~ "Canola",
+      TRUE ~ NA_character_
+    ),
+    Condition_AB = case_when(
+      grepl("^(LD)AB_", Label) ~ "AB",
+      grepl("^(LD)_", Label) ~ "without AB",
+      grepl("^(LD(ABD|FIX))", Label) ~ "AB fixed",
+      TRUE ~ NA_character_
+    ),
+    Time = case_when(
+      grepl("0hr", Label) ~ 0,
+      grepl("2hr", Label) ~ 2,
+      grepl("4hr", Label) ~ 4,
+      TRUE ~ NA_real_
+    ),
+    Exp_Label = case_when(
+      # LDABD (Day1 or Day2, multiple replicates, 0/2/4hr) - MOVED TO TOP
+      grepl("^LDABD_Day[12]_7E5_B[12]_(0hr|2hr|4hr)$", BioLabel) ~ {
+        sub("^LDABD_Day[12]_7E5_B[12]_(0hr|2hr|4hr)$", "LDABD_\\1", BioLabel)
+      },
+      # LDAB
+      grepl("^LDAB", BioLabel) ~ {
+        sub("^LDAB_Day[0-9]+(&[0-9]+)?_(?:[0-9]*[EF][0-9]+_)?(?:(Fmix)_)?(?:[0-9]*[EF][0-9]+_)?B[0-9]+_(.*)", 
+            "LDAB_\\2\\3", BioLabel)
+      },
+      # LD (without AB)
+      grepl("^LD_Day", BioLabel) ~ {
+        sub("^LD_Day[0-9]+(&[0-9]+)?_(?:[0-9]*[EF][0-9]+_)?(?:(Fmix)_)?(?:[0-9]*[EF][0-9]+_)?R[0-9]+_(.*)", 
+            "LD_\\2\\3", BioLabel)
+      },
+      # LDFIX (with or without number suffix)
+      grepl("^LDFIX", BioLabel) ~ {
+        sub("^LDFIX[0-9]*_Day[0-9]+(&[0-9]+)?_(?:[0-9]*[EF][0-9]+_)?(?:(Fmix)_)?(?:[0-9]*[EF][0-9]+_)?B[0-9]+_(.*)", 
+            "LDFIX_\\2\\3", BioLabel)
+      },
+      TRUE ~ BioLabel
+    )
+  )
+
+
+####### =============================== Section 3: Data process  ===============================
+
+# Identify unique oil types
+oil_types <- unique(all_data$Oil_type)
+
+# Loop over each oil type
+for(oil in oil_types) {
+  
+  cat("Processing Oil Type:", oil, "\n")
+  
+  oil_data <- all_data %>% filter(Oil_type == oil)
+  
+  # ---------------- Summarise technical replicates ----------------
+  summary_tech_table <- oil_data %>%
+    group_by(Label, BioLabel, Exp_Label, Time, Condition_AB, Oil_type) %>%
+    summarise(
+      n = n(),
+      Area_mean = mean(Area, na.rm = TRUE),
+      Area_sd   = sd(Area, na.rm = TRUE),
+      Circ_mean = mean(Circ., na.rm = TRUE),
+      Circ_sd   = sd(Circ., na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Add number of droplets
+  summary_tech_table_filtered <- summary_tech_table %>%
+    left_join(
+      summary_tech_table %>% select(Label, n_droplets = n),
+      by = "Label"
+    )
+  
+  # Filter out technical outliers
+  summary_tech_table_filtered <- summary_tech_table_filtered %>%
+    group_by(BioLabel, Exp_Label, Time, Condition_AB, Oil_type) %>%
+    mutate(
+      local_mean = mean(Area_mean, na.rm = TRUE),
+      local_sd   = sd(Area_mean, na.rm = TRUE),
+      lower = local_mean - local_sd,
+      upper = local_mean + local_sd
+    ) %>%
+    filter(Area_mean >= lower & Area_mean <= upper) %>%
+    select(-local_mean, -local_sd, -lower, -upper) %>%
+    ungroup()
+  
+  # ---------------- Bio replicate averages ----------------
+  summary_bio_table <- summary_tech_table_filtered %>%
+    group_by(BioLabel, Exp_Label) %>%
+    summarise(
+      n = n(),
+      n_droplets = sum(n_droplets, na.rm = TRUE),
+      Area_bio_mean = mean(Area_mean, na.rm = TRUE),
+      Area_bio_sd   = sd(Area_mean, na.rm = TRUE),
+      Circ_bio_mean = mean(Circ_mean, na.rm = TRUE),
+      Circ_bio_sd   = sd(Circ_mean, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # ---------------- Raw filtered data ----------------
+  filtered_labels <- summary_tech_table_filtered$Label
+  raw_data_exp_all <- oil_data %>% filter(Label %in% filtered_labels)
+  
+  # ---------------- Binned area distribution ----------------
+  breaks <- c(-Inf, 0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, Inf)
+  labels <- c("<0.0001","0.0001–0.0003","0.0003–0.001","0.001–0.003",
+              "0.003–0.01","0.01–0.03",">0.03")
+  
+  raw_data_exp_all <- raw_data_exp_all %>%
+    mutate(Area_bin = cut(Area, breaks = breaks, labels = labels, include.lowest = TRUE, right = FALSE))
+  
+  area_distribution_table <- raw_data_exp_all %>%
+    group_by(Exp_Label, Area_bin) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    group_by(Exp_Label) %>%
+    mutate(
+      total = sum(count),
+      percentage = (count / total) * 100
+    ) %>%
+    arrange(Exp_Label, Area_bin)
+  
+  # ---------------- Droplet counts ----------------
+  rep_counts <- raw_data_exp_all %>%
+    group_by(Exp_Label, BioLabel) %>%
+    summarise(n = n(), .groups = "drop")
+  
+  summary_counts <- rep_counts %>%
+    group_by(Exp_Label) %>%
+    summarise(
+      mean_n = mean(n),
+      sd_n   = sd(n),
+      .groups = "drop"
+    )
+  
+  max_perc <- 100
+  max_drops <- max(summary_counts$mean_n + summary_counts$sd_n, na.rm = TRUE)
+  scale_factor <- max_perc / max_drops
+  
+  rep_counts <- rep_counts %>% mutate(scaled_n = n * scale_factor)
+  
+  # ---------------- Plot ----------------
+  p <- ggplot(area_distribution_table, aes(x = Exp_Label, y = percentage, fill = Area_bin)) +
+    geom_bar(stat = "identity", position = "stack") +
+    geom_jitter(data = rep_counts, aes(x = Exp_Label, y = scaled_n),
+                inherit.aes = FALSE, width = 0.2, color = "black", alpha = 0.6, size = 1.5) +
+    geom_segment(data = summary_counts,
+                 aes(x = as.numeric(factor(Exp_Label)) - 0.3,
+                     xend = as.numeric(factor(Exp_Label)) + 0.3,
+                     y = mean_n * scale_factor,
+                     yend = mean_n * scale_factor),
+                 inherit.aes = FALSE, color = "red", linewidth = 1) +
+    geom_errorbar(data = summary_counts,
+                  aes(x = Exp_Label,
+                      ymin = (mean_n - sd_n) * scale_factor,
+                      ymax = (mean_n + sd_n) * scale_factor),
+                  inherit.aes = FALSE, color = "red", width = 0.3) +
+    scale_y_continuous(
+      name = "Percentage of Droplets",
+      sec.axis = sec_axis(~ . / scale_factor, name = "Droplet Count (replicates, mean ± SD)")
+    ) +
+    scale_fill_viridis_d(option = "mako", direction = -1) +
+    theme_minimal(base_size = 12) +
+    labs(title = paste("Oil Type:", oil, "- Stacked Distribution of Droplet Area"),
+         x = "Experiment", fill = "Area Bin") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+          axis.title = element_text(size = 12, face = "bold"),
+          strip.text = element_text(size = 11, face = "bold"),
+          legend.position = "right",
+          legend.title = element_text(size = 11, face = "bold"),
+          legend.text = element_text(size = 10),
+          plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+  
+  print(p)
+  
+  ggsave(filename = paste0("Area_Percentage_", oil, ".pdf"), plot = p, width = 20, height = 12, dpi = 300)
+}
+
+
+####### =============================== Section 4: Prepare data for stats ===============================
+
+# Combine all raw_data_exp_all from each oil type
+all_raw_data <- list()
+for(oil in oil_types) {
+  oil_data <- all_data %>% filter(Oil_type == oil)
+  summary_tech_table <- oil_data %>%
+    group_by(Label, BioLabel, Exp_Label, Time, Condition_AB, Oil_type) %>%
+    summarise(
+      n = n(),
+      Area_mean = mean(Area, na.rm = TRUE),
+      Area_sd   = sd(Area, na.rm = TRUE),
+      Circ_mean = mean(Circ., na.rm = TRUE),
+      Circ_sd   = sd(Circ., na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  summary_tech_table_filtered <- summary_tech_table %>%
+    left_join(
+      summary_tech_table %>% select(Label, n_droplets = n),
+      by = "Label"
+    )
+  
+  summary_tech_table_filtered <- summary_tech_table_filtered %>%
+    group_by(BioLabel, Exp_Label, Time, Condition_AB, Oil_type) %>%
+    mutate(
+      local_mean = mean(Area_mean, na.rm = TRUE),
+      local_sd   = sd(Area_mean, na.rm = TRUE),
+      lower = local_mean - local_sd,
+      upper = local_mean + local_sd
+    ) %>%
+    filter(Area_mean >= lower & Area_mean <= upper) %>%
+    select(-local_mean, -local_sd, -lower, -upper) %>%
+    ungroup()
+  
+  filtered_labels <- summary_tech_table_filtered$Label
+  raw_data_exp_all <- oil_data %>% filter(Label %in% filtered_labels)
+  
+  all_raw_data[[oil]] <- raw_data_exp_all
+}
+
+# Combine all raw data into one dataframe
+raw_all_exp <- bind_rows(all_raw_data)
+
+# Prepare subset_data: summarize raw data by technical replicates
+subset_data <- raw_all_exp %>%
+  group_by(Label, BioLabel, Exp_Label, Time, Condition_AB, Oil_type) %>%
+  summarise(
+    n = n(),
+    Area_mean = mean(Area, na.rm = TRUE),
+    Area_sd   = sd(Area, na.rm = TRUE),
+    Circ_mean = mean(Circ., na.rm = TRUE),
+    Circ_sd   = sd(Circ., na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Exp_Prefix = sub("_[0-9]hr$", "", Exp_Label)
+  )
+
+# Get unique oil types for the stats loop
+unique_oils <- unique(subset_data$Oil_type)
+
+
+##### =============================== Section 5: Stats Loop ===============================
+
+# ---- Function to run pairwise comparisons ----
+run_pairwise <- function(df, group_var, value_var = "Area_mean", is_normal = TRUE) {
+  num_groups <- n_distinct(df[[group_var]])
+  if (num_groups < 2) return(NULL)
+  
+  result <- NULL
+  if (num_groups == 2) {
+    if (is_normal) {
+      test_res <- t.test(as.formula(paste(value_var, "~", group_var)), data = df)
+      test_type <- "T-test"
+    } else {
+      test_res <- wilcox.test(as.formula(paste(value_var, "~", group_var)), data = df)
+      test_type <- "Wilcoxon"
+    }
+    result <- data.frame(
+      Comparison = paste(unique(df[[group_var]]), collapse = " vs "),
+      Test_Type  = test_type,
+      P_Value    = test_res$p.value,
+      Star       = ifelse(test_res$p.value <= 0.05, "*", "")
+    )
+  } else if (num_groups > 2) {
+    if (is_normal) {
+      aov_res <- aov(as.formula(paste(value_var, "~", group_var)), data = df)
+      tukey_res <- tryCatch(TukeyHSD(aov_res), error = function(e) NULL)
+      if (!is.null(tukey_res)) {
+        tidy_df <- broom::tidy(tukey_res)
+        result <- tidy_df %>%
+          rename_with(~ gsub("contrast", "Comparison", .x)) %>%
+          rename_with(~ gsub("adj.p.value", "P_Value", .x)) %>%
+          mutate(
+            Test_Type = "ANOVA-Tukey",
+            Star = case_when(
+              P_Value <= 0.0001 ~ "****",
+              P_Value <= 0.001  ~ "***",
+              P_Value <= 0.01   ~ "**",
+              P_Value <= 0.05   ~ "*",
+              TRUE              ~ ""
+            )
+          ) %>%
+          select(Comparison, Test_Type, P_Value, Star)
+      }
+    } else {
+      # Use FSA::dunnTest instead of rstatix::dunn_test
+      dunn_res <- tryCatch({
+        FSA::dunnTest(as.formula(paste(value_var, "~", group_var)), data = df, method = "bonferroni")
+      }, error = function(e) NULL)
+      
+      if (!is.null(dunn_res)) {
+        result <- dunn_res$res %>%
+          mutate(
+            Comparison = paste(Comparison),
+            Test_Type  = "Kruskal-Dunn",
+            P_Value = P.adj,
+            Star = case_when(
+              P.adj <= 0.0001 ~ "****",
+              P.adj <= 0.001  ~ "***",
+              P.adj <= 0.01   ~ "**",
+              P.adj <= 0.05   ~ "*",
+              TRUE            ~ ""
+            )
+          ) %>%
+          select(Comparison, Test_Type, P_Value, Star)
+      }
+    }
+  }
+  return(result)
+}
+
+# ---- MAIN LOOP ----
+all_results <- list()
+normality_results <- data.frame()
+
+for (oil in unique_oils) {
+  cat("\n========================================\n")
+  cat("Processing Oil Type:", oil, "\n")
+  cat("========================================\n")
+  
+  # Subset data for this oil
+  oil_data <- subset_data %>% filter(Oil_type == oil)
+  if (nrow(oil_data) == 0) next
+  
+  oil_data <- oil_data %>%
+    mutate(
+      Exp_Label = factor(Exp_Label),
+      Time      = factor(Time)
+    )
+  
+  # ---- STEP 0: Run Shapiro-Wilk test on raw data for this Oil_type ----
+  cat("\n--- Running Shapiro-Wilk Normality Test ---\n")
+  
+  shapiro_per_group <- oil_data %>%
+    group_by(Exp_Label, Time) %>%
+    summarise(
+      n = n(),
+      shapiro_p = if(n() >= 3) shapiro.test(Area_mean)$p.value else NA,
+      .groups = "drop"
+    )
+  
+  print(shapiro_per_group)
+  
+  # Determine if data is normal (all groups have p >= 0.05)
+  is_normal <- all(shapiro_per_group$shapiro_p >= 0.05, na.rm = TRUE)
+  
+  cat("\nOverall normality for Oil", oil, ":", ifelse(is_normal, "NORMAL", "NON-NORMAL"), "\n")
+  
+  # Store normality results
+  shapiro_summary <- data.frame(
+    Oil_type = oil,
+    Overall_Normal = is_normal,
+    Min_Shapiro_P = min(shapiro_per_group$shapiro_p, na.rm = TRUE),
+    Max_Shapiro_P = max(shapiro_per_group$shapiro_p, na.rm = TRUE),
+    N_Groups_Tested = sum(!is.na(shapiro_per_group$shapiro_p))
+  )
+  normality_results <- bind_rows(normality_results, shapiro_summary)
+  
+  # ---- 1A: Time comparisons within each Exp_Prefix ----
+  cat("\n--- 1A: Time comparisons within Exp_Prefix ---\n")
+  results_1A <- list()
+  for (exp_prefix in unique(oil_data$Exp_Prefix)) {
+    data_exp <- oil_data %>%
+      filter(Exp_Prefix == exp_prefix) %>%
+      mutate(Time = factor(Time, levels = sort(unique(Time))))
+    
+    if (n_distinct(data_exp$Time) < 2) next
+    
+    stat_res <- run_pairwise(data_exp, "Time", value_var = "Area_mean", is_normal = is_normal)
+    if (!is.null(stat_res)) {
+      stat_res <- stat_res %>%
+        mutate(Oil_type = oil, Grouping = "Exp_Prefix",
+               Exp_Prefix = exp_prefix, By = "Time")
+      results_1A[[exp_prefix]] <- stat_res
+    }
+  }
+  df_1A <- if (length(results_1A) > 0) bind_rows(results_1A) else data.frame()
+  
+  # ---- 1B: Exp_Label comparisons at each Time ----
+  cat("--- 1B: Exp_Label comparisons at each Time ---\n")
+  results_1B <- list()
+  for (t in unique(oil_data$Time)) {
+    data_time <- oil_data %>% filter(Time == t)
+    if (n_distinct(data_time$Exp_Label) < 2) next
+    
+    stat_res <- run_pairwise(data_time, "Exp_Label", value_var = "Area_mean", is_normal = is_normal)
+    if (!is.null(stat_res)) {
+      stat_res <- stat_res %>%
+        mutate(Oil_type = oil, Grouping = "Time", Time = t, By = "Exp_Label")
+      results_1B[[t]] <- stat_res
+    }
+  }
+  df_1B <- if (length(results_1B) > 0) bind_rows(results_1B) else data.frame()
+  
+  # ---- 2. Two-way ANOVA (ALWAYS RUN) ----
+  cat("\n--- 2. Two-way ANOVA ---\n")
+  anova_model <- aov(Area_mean ~ Exp_Label * Time, data = oil_data)
+  anova_summary <- summary(anova_model)
+  print(anova_summary)
+  
+  tukey_exp_time <- tryCatch(TukeyHSD(anova_model), error = function(e) NULL)
+  
+  tukey_table <- NULL
+  if (!is.null(tukey_exp_time)) {
+    tidy_df <- tryCatch(broom::tidy(tukey_exp_time$`Exp_Label:Time`), error = function(e) NULL)
+    if (!is.null(tidy_df) && nrow(tidy_df) > 0) {
+      comp_col <- intersect(c("contrast", "comparison"), names(tidy_df))
+      p_col    <- intersect(c("p.adj", "adj.p.value", "p.value"), names(tidy_df))
+      if (length(comp_col) > 0 && length(p_col) > 0) {
+        tukey_table <- tidy_df %>%
+          rename(Comparison = all_of(comp_col[1]),
+                 P_Value    = all_of(p_col[1])) %>%
+          mutate(Oil_type = oil)
+      }
+    }
+  }
+  
+  # ---- 3. Pairwise Exp_Label × Time (ALWAYS RUN) ----
+  cat("\n--- 3. Pairwise Exp_Label × Time interaction ---\n")
+  oil_data <- oil_data %>% mutate(ExpTime = interaction(Exp_Label, Time, sep = "_"))
+  
+  pairwise_interaction <- tryCatch(
+    oil_data %>% rstatix::pairwise_t_test(Area_mean ~ ExpTime, p.adjust.method = "bonferroni"),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(pairwise_interaction)) {
+    cat("Pairwise tests completed:", nrow(pairwise_interaction), "comparisons\n")
+  }
+  
+  # ---- Save results into list ----
+  all_results[[oil]] <- list(
+    Normality_Test        = shapiro_per_group,
+    Normality_Summary     = shapiro_summary,
+    Time_within_ExpPrefix = df_1A,
+    ExpLabel_at_Time      = df_1B,
+    ANOVA_model           = anova_summary,
+    TukeyHSD_ExpTime      = tukey_table,
+    Pairwise_ExpTime      = pairwise_interaction
+  )
+  
+  # ---- Save CSVs ----
+  write.csv(shapiro_per_group, paste0("Oil_", oil, "_Normality.csv"), row.names = FALSE)
+  if (nrow(df_1A) > 0) write.csv(df_1A, paste0("Oil_", oil, "_TimeWithinExpPrefix.csv"), row.names = FALSE)
+  if (nrow(df_1B) > 0) write.csv(df_1B, paste0("Oil_", oil, "_ExpLabelAtTime.csv"), row.names = FALSE)
+  if (!is.null(tukey_table) && nrow(tukey_table) > 0) write.csv(tukey_table, paste0("Oil_", oil, "_TukeyHSD.csv"), row.names = FALSE)
+  if (!is.null(pairwise_interaction) && nrow(pairwise_interaction) > 0) write.csv(pairwise_interaction, paste0("Oil_", oil, "_Pairwise.csv"), row.names = FALSE)
+}
+
+# ---- Save all results for reproducibility ----
+saveRDS(all_results, "all_oil_results.RDS")
+write.csv(normality_results, "All_Oils_Normality_Summary.csv", row.names = FALSE)
+
+cat("\n========================================\n")
+cat("Analysis Complete!\n")
+cat("========================================\n")
+print(normality_results)
+
+
+######### =============================== Section 6: Circularity Loop ===============================
+
+# Use the combined raw_all_exp data
+raw_data_exp_all_binned <- raw_all_exp %>%
+  mutate(
+    Area_bin = cut(
+      Area,
+      breaks = c(-Inf, 0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, Inf),
+      labels = c("<0.0001","0.0001–0.0003","0.0003–0.001","0.001–0.003","0.003–0.01","0.01–0.03",">0.03"),
+      include.lowest = TRUE,
+      right = FALSE
+    )
+  )
+
+# Get unique oil types
+unique_oils_circ <- unique(raw_data_exp_all_binned$Oil_type)
+
+for(oil in unique_oils_circ) {
+  
+  cat("Plotting Circularity for Oil Type:", oil, "\n")
+  
+  data_oil <- raw_data_exp_all_binned %>% filter(Oil_type == oil)
+  
+  # Compute percentage and counts per Area_bin within each Exp_Label
+  counts_per_bin_percentage <- data_oil %>%
+    group_by(Exp_Label, Area_bin) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(Exp_Label) %>%
+    mutate(
+      percentage = n / sum(n) * 100,
+      total = sum(n)
+    ) %>%
+    ungroup()
+  
+  # Calculate total n per Exp_Label for facet labels
+  total_per_exp <- data_oil %>%
+    group_by(Exp_Label) %>%
+    summarise(total_n = n(), .groups = "drop") %>%
+    mutate(label = paste0("n = ", total_n))
+  
+  # Violin plot with percentage and n count annotations
+  p <- ggplot(data_oil, aes(x = Area_bin, y = Circ., fill = Area_bin)) +
+    geom_violin(alpha = 0.7, scale = "width", trim = FALSE) +
+    geom_boxplot(width = 0.1, fill = NA, outlier.alpha = 0.3, color = "black") +
+    geom_text(
+      data = counts_per_bin_percentage,
+      aes(x = Area_bin, y = 1.15, label = paste0(round(percentage, 1), "% (n=", n, ")")),
+      inherit.aes = FALSE,
+      size = 4,
+      fontface = "bold",
+      color = "black"
+    ) +
+    geom_text(
+      data = total_per_exp,
+      aes(x = 7.5, y = 1.15, label = label),
+      inherit.aes = FALSE,
+      hjust = 0.5,
+      size = 4.5,
+      fontface = "bold",
+      color = "black"
+    ) +
+    geom_hline(yintercept = 0.65, linetype = "dashed", color = "red", size = 0.5) +
+    facet_wrap(~ Exp_Label, scales = "fixed") +
+    scale_fill_viridis_d(option = "mako", direction = -1) +
+    scale_y_continuous(limits = c(0, 1.25), expand = c(0, 0)) +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = paste("Distribution of Droplet Circularity per Area Bin (Percentage) -", oil),
+      x = "Droplet Area",
+      y = "Circularity",
+      fill = "Area range"
+    ) +
+    theme(
+      panel.background = element_rect(fill = "transparent", color = NA),
+      plot.background = element_rect(fill = "transparent", color = NA),
+      panel.grid.major = element_line(color = "gray90", size = 0.3),
+      panel.grid.minor = element_blank(),
+      #strip.background = element_rect(fill = "gray95", color = "black"),
+      axis.text.x = element_text(color="black",angle = 45, hjust = 1, size = 10, face = "bold"),
+      axis.text.y = element_text(color="black",size = 10, face = "bold"),
+      axis.title = element_text(size = 12, face = "bold"),
+      strip.text = element_text(size = 11, face = "bold"),
+      legend.position = "right",
+      legend.background = element_rect(fill = "transparent", color = NA),
+      legend.key = element_rect(fill = "transparent", color = NA),
+      legend.title = element_text(size = 11, face = "bold"),
+      legend.text = element_text(size = 10),
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.margin = margin(10, 10, 10, 10)
+    ) +
+    coord_flip(clip = "off")
+  
+  # Print the plot
+  print(p)
+  
+  # Optionally, save the plot
+  ggsave(filename = paste0("Circularity_Percentage_", oil, ".pdf"), plot = p, width = 20, height = 12, dpi = 300)
+  
+}
+
+######################################## Section 7 Normalisation ########################################
+
+######## Normalized Area, Circularisation and Droplet Count for each Bio replicate to without AB condition ########
+# Identify unique oil types
+oil_types <- unique(all_data$Oil_type)
+
+# Initialise storage for combined results
+all_normalized <- list()
+all_stats <- list()
+
+# Loop over each oil type
+for(oil in oil_types) {
+  
+  cat("Processing Oil Type:", oil, "\n")
+  
+  oil_data <- all_data %>% filter(Oil_type == oil)
+  
+  # ---------------- Summarise technical replicates ----------------
+  summary_tech_table <- oil_data %>%
+    group_by(Label, BioLabel, Exp_Label, Time, Condition_AB, Oil_type) %>%
+    summarise(
+      n = n(),
+      Area_mean = mean(Area, na.rm = TRUE),
+      Area_sd   = sd(Area, na.rm = TRUE),
+      Circ_mean = mean(Circ., na.rm = TRUE),
+      Circ_sd   = sd(Circ., na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Add number of droplets
+  summary_tech_table_filtered <- summary_tech_table %>%
+    left_join(
+      summary_tech_table %>% select(Label, n_droplets = n),
+      by = "Label"
+    )
+  
+  # Filter out technical outliers
+  summary_tech_table_filtered <- summary_tech_table_filtered %>%
+    group_by(BioLabel, Exp_Label, Time, Condition_AB, Oil_type) %>%
+    mutate(
+      local_mean = mean(Area_mean, na.rm = TRUE),
+      local_sd   = sd(Area_mean, na.rm = TRUE),
+      lower = local_mean - local_sd,
+      upper = local_mean + local_sd
+    ) %>%
+    filter(Area_mean >= lower & Area_mean <= upper) %>%
+    select(-local_mean, -local_sd, -lower, -upper) %>%
+    ungroup()
+  
+  # ---------------- Bio replicate averages ----------------
+  summary_bio_table <- summary_tech_table_filtered %>%
+    group_by(BioLabel, Exp_Label, Time, Condition_AB) %>%
+    summarise(
+      n = n(),
+      n_droplets = sum(n_droplets, na.rm = TRUE),
+      Area_bio_mean = mean(Area_mean, na.rm = TRUE),
+      Area_bio_sd   = sd(Area_mean, na.rm = TRUE),
+      Circ_bio_mean = mean(Circ_mean, na.rm = TRUE),
+      Circ_bio_sd   = sd(Circ_mean, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # ---------------- Normalize to "without AB" at each time point ----------------
+  # Get baseline values (without AB) for each time point
+  baseline_values <- summary_bio_table %>%
+    filter(Condition_AB == "without AB") %>%
+    group_by(Time) %>%
+    summarise(
+      baseline_area     = mean(Area_bio_mean, na.rm = TRUE),
+      baseline_circ     = mean(Circ_bio_mean, na.rm = TRUE),
+      baseline_droplets = mean(n_droplets, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Join baseline and calculate normalized values
+  summary_bio_normalized <- summary_bio_table %>%
+    left_join(baseline_values, by = "Time") %>%
+    mutate(
+      Area_normalized     = Area_bio_mean / baseline_area,
+      Circ_normalized     = Circ_bio_mean / baseline_circ,
+      Droplets_normalized = n_droplets   / baseline_droplets,
+      Oil_type = oil
+    )
+  
+  # Calculate mean and SD for normalized values by condition and time
+  summary_normalized_stats <- summary_bio_normalized %>%
+    group_by(Time, Condition_AB, Oil_type) %>%
+    summarise(
+      Area_norm_mean     = mean(Area_normalized, na.rm = TRUE),
+      Area_norm_sd       = sd(Area_normalized, na.rm = TRUE),
+      Area_norm_se       = sd(Area_normalized, na.rm = TRUE) / sqrt(n()),
+      Circ_norm_mean     = mean(Circ_normalized, na.rm = TRUE),
+      Circ_norm_sd       = sd(Circ_normalized, na.rm = TRUE),
+      Circ_norm_se       = sd(Circ_normalized, na.rm = TRUE) / sqrt(n()),
+      Droplets_norm_mean = mean(Droplets_normalized, na.rm = TRUE),
+      Droplets_norm_sd   = sd(Droplets_normalized, na.rm = TRUE),
+      Droplets_norm_se   = sd(Droplets_normalized, na.rm = TRUE) / sqrt(n()),
+      n_replicates       = n(),
+      .groups = "drop"
+    )
+  
+  # ---------------- Plot normalized droplet count ----------------
+  p_droplets <- ggplot(summary_normalized_stats, 
+                       aes(x = Time, y = Droplets_norm_mean, color = Condition_AB, group = Condition_AB)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = Droplets_norm_mean - Droplets_norm_se, 
+                      ymax = Droplets_norm_mean + Droplets_norm_se),
+                  width = 0.1, linewidth = 0.8) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+    scale_color_viridis_d(option = "plasma", end = 0.8) +
+    theme_minimal(base_size = 12) +
+    labs(title = paste("Oil Type:", oil, "- Normalized Droplet Count"),
+         subtitle = "Normalized to 'without AB' at each time point (mean ± SE)",
+         x = "Time",
+         y = "Normalized Droplet Count (relative to without AB)",
+         color = "Condition") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+          axis.title = element_text(size = 12, face = "bold"),
+          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 11, hjust = 0.5),
+          legend.position = "right",
+          legend.title = element_text(size = 11, face = "bold"),
+          legend.text = element_text(size = 10))
+  
+  print(p_droplets)
+  ggsave(filename = paste0("Normalized_Droplets_", oil, ".pdf"), 
+         plot = p_droplets, width = 12, height = 8, dpi = 300)
+  
+  # ---------------- Plot normalized area ----------------
+  p_area <- ggplot(summary_normalized_stats, 
+                   aes(x = Time, y = Area_norm_mean, color = Condition_AB, group = Condition_AB)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = Area_norm_mean - Area_norm_se, 
+                      ymax = Area_norm_mean + Area_norm_se),
+                  width = 0.1, linewidth = 0.8) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+    scale_color_viridis_d(option = "plasma", end = 0.8) +
+    theme_minimal(base_size = 12) +
+    labs(title = paste("Oil Type:", oil, "- Normalized Droplet Area"),
+         subtitle = "Normalized to 'without AB' at each time point (mean ± SE)",
+         x = "Time",
+         y = "Normalized Area (relative to without AB)",
+         color = "Condition") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+          axis.title = element_text(size = 12, face = "bold"),
+          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 11, hjust = 0.5),
+          legend.position = "right",
+          legend.title = element_text(size = 11, face = "bold"),
+          legend.text = element_text(size = 10))
+  
+  print(p_area)
+  ggsave(filename = paste0("Normalized_Area_", oil, ".pdf"), 
+         plot = p_area, width = 12, height = 8, dpi = 300)
+  
+  # ---------------- Plot normalized circularity ----------------
+  p_circ <- ggplot(summary_normalized_stats, 
+                   aes(x = Time, y = Circ_norm_mean, color = Condition_AB, group = Condition_AB)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = Circ_norm_mean - Circ_norm_se, 
+                      ymax = Circ_norm_mean + Circ_norm_se),
+                  width = 0.1, linewidth = 0.8) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+    scale_color_viridis_d(option = "plasma", end = 0.8) +
+    theme_minimal(base_size = 12) +
+    labs(title = paste("Oil Type:", oil, "- Normalized Droplet Circularity"),
+         subtitle = "Normalized to 'without AB' at each time point (mean ± SE)",
+         x = "Time",
+         y = "Normalized Circularity (relative to without AB)",
+         color = "Condition") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+          axis.title = element_text(size = 12, face = "bold"),
+          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 11, hjust = 0.5),
+          legend.position = "right",
+          legend.title = element_text(size = 11, face = "bold"),
+          legend.text = element_text(size = 10))
+  
+  print(p_circ)
+  ggsave(filename = paste0("Normalized_Circularity_", oil, ".pdf"), 
+         plot = p_circ, width = 12, height = 8, dpi = 300)
+  
+  # ---------------- Save normalized data table ----------------
+  # ---------------- Save per-oil files ----------------
+  write.csv(summary_bio_normalized, 
+            file = paste0("Normalized_droplets_Data_", oil, ".csv"), 
+            row.names = FALSE)
+  
+  write.csv(summary_normalized_stats, 
+            file = paste0("Normalized_droplets_Stats_", oil, ".csv"), 
+            row.names = FALSE)
+  
+  # ---------------- Store for combined files ----------------
+  all_normalized[[oil]] <- summary_bio_normalized
+  all_stats[[oil]] <- summary_normalized_stats
+}
+
+# ---------------- Combine across oils ----------------
+summary_bio_normalized_all <- bind_rows(all_normalized)
+summary_normalized_stats_all <- bind_rows(all_stats)
+
+# Save combined files
+write.csv(summary_bio_normalized_all, "All_Oils_Normalized_Data.csv", row.names = FALSE)
+write.csv(summary_normalized_stats_all, "All_Oils_Normalized_Stats.csv", row.names = FALSE)
+######### Same but by Area range (including Droplet Count) ########
+
+# Identify unique oil types
+oil_types <- unique(all_data$Oil_type)
+
+# Loop over each oil type
+for(oil in oil_types) {
+  
+  cat("Processing Oil Type:", oil, "\n")
+  
+  oil_data <- all_data %>% filter(Oil_type == oil)
+  
+  # ---------------- Summarise technical replicates ----------------
+  summary_tech_table <- oil_data %>%
+    group_by(Label, BioLabel, Exp_Label, Time, Condition_AB, Oil_type) %>%
+    summarise(
+      n = n(),
+      Area_mean = mean(Area, na.rm = TRUE),
+      Area_sd   = sd(Area, na.rm = TRUE),
+      Circ_mean = mean(Circ., na.rm = TRUE),
+      Circ_sd   = sd(Circ., na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Add number of droplets
+  summary_tech_table_filtered <- summary_tech_table %>%
+    left_join(
+      summary_tech_table %>% select(Label, n_droplets = n),
+      by = "Label"
+    )
+  
+  # Filter out technical outliers
+  summary_tech_table_filtered <- summary_tech_table_filtered %>%
+    group_by(BioLabel, Exp_Label, Time, Condition_AB, Oil_type) %>%
+    mutate(
+      local_mean = mean(Area_mean, na.rm = TRUE),
+      local_sd   = sd(Area_mean, na.rm = TRUE),
+      lower = local_mean - local_sd,
+      upper = local_mean + local_sd
+    ) %>%
+    filter(Area_mean >= lower & Area_mean <= upper) %>%
+    select(-local_mean, -local_sd, -lower, -upper) %>%
+    ungroup()
+  
+  # ---------------- Raw filtered data ----------------
+  filtered_labels <- summary_tech_table_filtered$Label
+  raw_data_exp_all <- oil_data %>% filter(Label %in% filtered_labels)
+  
+  # ---------------- Bin by area ----------------
+  breaks <- c(-Inf, 0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, Inf)
+  labels <- c("<0.0001","0.0001–0.0003","0.0003–0.001","0.001–0.003",
+              "0.003–0.01","0.01–0.03",">0.03")
+  
+  raw_data_exp_all <- raw_data_exp_all %>%
+    mutate(Area_bin = cut(Area, breaks = breaks, labels = labels, include.lowest = TRUE, right = FALSE))
+  
+  # ---------------- Bio replicate averages by bin ----------------
+  summary_bio_by_bin <- raw_data_exp_all %>%
+    group_by(BioLabel, Exp_Label, Time, Condition_AB, Area_bin) %>%
+    summarise(
+      n_droplets = n(),
+      Area_bio_mean = mean(Area, na.rm = TRUE),
+      Area_bio_sd   = sd(Area, na.rm = TRUE),
+      Circ_bio_mean = mean(Circ., na.rm = TRUE),
+      Circ_bio_sd   = sd(Circ., na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # ---------------- Normalize to "without AB" at each time point and bin ----------------
+  baseline_values_by_bin <- summary_bio_by_bin %>%
+    filter(Condition_AB == "without AB") %>%
+    group_by(Time, Area_bin) %>%
+    summarise(
+      baseline_area     = mean(Area_bio_mean, na.rm = TRUE),
+      baseline_circ     = mean(Circ_bio_mean, na.rm = TRUE),
+      baseline_droplets = mean(n_droplets, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  summary_bio_normalized_by_bin <- summary_bio_by_bin %>%
+    left_join(baseline_values_by_bin, by = c("Time", "Area_bin")) %>%
+    mutate(
+      Area_normalized     = ifelse(!is.na(baseline_area) & baseline_area > 0,
+                                   Area_bio_mean / baseline_area, NA_real_),
+      Circ_normalized     = ifelse(!is.na(baseline_circ) & baseline_circ > 0,
+                                   Circ_bio_mean / baseline_circ, NA_real_),
+      Droplets_normalized = ifelse(!is.na(baseline_droplets) & baseline_droplets > 0,
+                                   n_droplets / baseline_droplets, NA_real_)
+    )
+  
+  # ---------------- Summary stats ----------------
+  summary_normalized_stats_by_bin <- summary_bio_normalized_by_bin %>%
+    group_by(Time, Condition_AB, Area_bin) %>%
+    summarise(
+      Area_norm_mean     = mean(Area_normalized, na.rm = TRUE),
+      Area_norm_sd       = sd(Area_normalized, na.rm = TRUE),
+      Area_norm_se       = sd(Area_normalized, na.rm = TRUE) / sqrt(n()),
+      Circ_norm_mean     = mean(Circ_normalized, na.rm = TRUE),
+      Circ_norm_sd       = sd(Circ_normalized, na.rm = TRUE),
+      Circ_norm_se       = sd(Circ_normalized, na.rm = TRUE) / sqrt(n()),
+      Droplets_norm_mean = mean(Droplets_normalized, na.rm = TRUE),
+      Droplets_norm_sd   = sd(Droplets_normalized, na.rm = TRUE),
+      Droplets_norm_se   = sd(Droplets_normalized, na.rm = TRUE) / sqrt(n()),
+      n_replicates       = n(),
+      total_droplets     = sum(n_droplets, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # ---------------- Plot normalized area by bin ----------------
+  p_area <- ggplot(summary_normalized_stats_by_bin, 
+                   aes(x = Time, y = Area_norm_mean, color = Condition_AB, group = Condition_AB)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = Area_norm_mean - Area_norm_se, ymax = Area_norm_mean + Area_norm_se),
+                  width = 0.1, linewidth = 0.8) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+    facet_wrap(~ Area_bin, scales = "free_y", ncol = 3) +
+    scale_color_viridis_d(option = "plasma", end = 0.8) +
+    theme_minimal(base_size = 12) +
+    labs(title = paste("Oil Type:", oil, "- Normalized Droplet Area by Size Range"),
+         subtitle = "Normalized to 'without AB' at each time point within each bin (mean ± SE)",
+         x = "Time", y = "Normalized Area (relative to without AB)", color = "Condition")
+  
+  print(p_area)
+  ggsave(filename = paste0("Normalized_Area_ByBin_", oil, ".pdf"), plot = p_area, width = 14, height = 10, dpi = 300)
+  
+  # ---------------- Plot normalized circularity by bin ----------------
+  p_circ <- ggplot(summary_normalized_stats_by_bin, 
+                   aes(x = Time, y = Circ_norm_mean, color = Condition_AB, group = Condition_AB)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = Circ_norm_mean - Circ_norm_se, ymax = Circ_norm_mean + Circ_norm_se),
+                  width = 0.1, linewidth = 0.8) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+    facet_wrap(~ Area_bin, scales = "free_y", ncol = 3) +
+    scale_color_viridis_d(option = "plasma", end = 0.8) +
+    theme_minimal(base_size = 12) +
+    labs(title = paste("Oil Type:", oil, "- Normalized Droplet Circularity by Size Range"),
+         subtitle = "Normalized to 'without AB' at each time point within each bin (mean ± SE)",
+         x = "Time", y = "Normalized Circularity (relative to without AB)", color = "Condition")
+  
+  print(p_circ)
+  ggsave(filename = paste0("Normalized_Circularity_ByBin_", oil, ".pdf"), plot = p_circ, width = 14, height = 10, dpi = 300)
+  
+  # ---------------- Plot normalized droplet counts by bin ----------------
+  p_droplets <- ggplot(summary_normalized_stats_by_bin, 
+                       aes(x = Time, y = Droplets_norm_mean, color = Condition_AB, group = Condition_AB)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = Droplets_norm_mean - Droplets_norm_se, ymax = Droplets_norm_mean + Droplets_norm_se),
+                  width = 0.1, linewidth = 0.8) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+    facet_wrap(~ Area_bin, scales = "free_y", ncol = 3) +
+    scale_color_viridis_d(option = "plasma", end = 0.8) +
+    theme_minimal(base_size = 12) +
+    labs(title = paste("Oil Type:", oil, "- Normalized Droplet Count by Size Range"),
+         subtitle = "Normalized to 'without AB' at each time point within each bin (mean ± SE)",
+         x = "Time", y = "Normalized Droplet Count (relative to without AB)", color = "Condition")
+  
+  print(p_droplets)
+  ggsave(filename = paste0("Normalized_Droplets_ByBin_", oil, ".pdf"), plot = p_droplets, width = 14, height = 10, dpi = 300)
+  
+  # ---------------- Save normalized data tables ----------------
+  write.csv(summary_bio_normalized_by_bin, file = paste0("Normalized_Data_ByBin_", oil, ".csv"), row.names = FALSE)
+  write.csv(summary_normalized_stats_by_bin, file = paste0("Normalized_Stats_ByBin_", oil, ".csv"), row.names = FALSE)
+  write.csv(baseline_values_by_bin, file = paste0("Baseline_Values_ByBin_", oil, ".csv"), row.names = FALSE)
+}
+
+
+
+
+##### =============================== Section 8: Stats Loop ===============================
+
+# ---- Choose variable to analyze ----
+# Options: "Area", "Cir", "Droplets"
+response_var <- "Droplets_normalized"
+
+# ---- Function to run pairwise comparisons ----
+run_pairwise <- function(df, group_var, value_var, is_normal = TRUE) {
+  num_groups <- n_distinct(df[[group_var]])
+  if (num_groups < 2) return(NULL)
+  
+  result <- NULL
+  if (num_groups == 2) {
+    if (is_normal) {
+      test_res <- t.test(as.formula(paste(value_var, "~", group_var)), data = df)
+      test_type <- "T-test"
+    } else {
+      test_res <- wilcox.test(as.formula(paste(value_var, "~", group_var)), data = df)
+      test_type <- "Wilcoxon"
+    }
+    result <- data.frame(
+      Comparison = paste(unique(df[[group_var]]), collapse = " vs "),
+      Test_Type  = test_type,
+      P_Value    = test_res$p.value,
+      Star       = ifelse(test_res$p.value <= 0.05, "*", "")
+    )
+  } else if (num_groups > 2) {
+    if (is_normal) {
+      aov_res <- aov(as.formula(paste(value_var, "~", group_var)), data = df)
+      tukey_res <- tryCatch(TukeyHSD(aov_res), error = function(e) NULL)
+      if (!is.null(tukey_res)) {
+        tidy_df <- broom::tidy(tukey_res)
+        result <- tidy_df %>%
+          rename_with(~ gsub("contrast", "Comparison", .x)) %>%
+          rename_with(~ gsub("adj.p.value", "P_Value", .x)) %>%
+          mutate(
+            Test_Type = "ANOVA-Tukey",
+            Star = case_when(
+              P_Value <= 0.0001 ~ "****",
+              P_Value <= 0.001  ~ "***",
+              P_Value <= 0.01   ~ "**",
+              P_Value <= 0.05   ~ "*",
+              TRUE              ~ ""
+            )
+          ) %>%
+          select(Comparison, Test_Type, P_Value, Star)
+      }
+    } else {
+      dunn_res <- tryCatch({
+        FSA::dunnTest(as.formula(paste(value_var, "~", group_var)), data = df, method = "bonferroni")
+      }, error = function(e) NULL)
+      
+      if (!is.null(dunn_res)) {
+        result <- dunn_res$res %>%
+          mutate(
+            Comparison = paste(Comparison),
+            Test_Type  = "Kruskal-Dunn",
+            P_Value = P.adj,
+            Star = case_when(
+              P.adj <= 0.0001 ~ "****",
+              P.adj <= 0.001  ~ "***",
+              P.adj <= 0.01   ~ "**",
+              P.adj <= 0.05   ~ "*",
+              TRUE            ~ ""
+            )
+          ) %>%
+          select(Comparison, Test_Type, P_Value, Star)
+      }
+    }
+  }
+  return(result)
+}
+
+# ---- MAIN LOOP ----
+all_results <- list()
+normality_results <- data.frame()
+
+summary_bio_normalized_all <- summary_bio_normalized_all %>%
+  mutate(Exp_Prefix = sub("_[0-9]+hr", "", Exp_Label))
+
+for (oil in unique_oils) {
+  cat("\n========================================\n")
+  cat("Processing Oil Type:", oil, "\n")
+  cat("========================================\n")
+  
+  # Subset data
+  oil_data <- summary_bio_normalized_all %>% filter(Oil_type == oil)
+  if (nrow(oil_data) == 0) next
+  
+  oil_data <- oil_data %>%
+    mutate(
+      Exp_Label = factor(Exp_Label),
+      Time      = factor(Time)
+    )
+  
+  # ---- STEP 0: Shapiro-Wilk Normality ----
+  cat("\n--- Running Shapiro-Wilk Normality Test ---\n")
+  
+  shapiro_per_group <- oil_data %>%
+    group_by(Exp_Label, Time) %>%
+    summarise(
+      n = n(),
+      shapiro_p = if(n() >= 3) shapiro.test(.data[[response_var]])$p.value else NA,
+      .groups = "drop"
+    )
+  
+  print(shapiro_per_group)
+  
+  is_normal <- all(shapiro_per_group$shapiro_p >= 0.05, na.rm = TRUE)
+  
+  cat("\nOverall normality for Oil", oil, ":", ifelse(is_normal, "NORMAL", "NON-NORMAL"), "\n")
+  
+  # Store normality results
+  shapiro_summary <- data.frame(
+    Oil_type = oil,
+    Variable = response_var,
+    Overall_Normal = is_normal,
+    Min_Shapiro_P = min(shapiro_per_group$shapiro_p, na.rm = TRUE),
+    Max_Shapiro_P = max(shapiro_per_group$shapiro_p, na.rm = TRUE),
+    N_Groups_Tested = sum(!is.na(shapiro_per_group$shapiro_p))
+  )
+  normality_results <- bind_rows(normality_results, shapiro_summary)
+  
+  # ---- 1A: Time comparisons ----
+  results_1A <- list()
+  for (exp_prefix in unique(oil_data$Exp_Prefix)) {
+    data_exp <- oil_data %>%
+      filter(Exp_Prefix == exp_prefix) %>%
+      mutate(Time = factor(Time, levels = sort(unique(Time))))
+    
+    if (n_distinct(data_exp$Time) < 2) next
+    
+    stat_res <- run_pairwise(data_exp, "Time", value_var = response_var, is_normal = is_normal)
+    if (!is.null(stat_res)) {
+      stat_res <- stat_res %>%
+        mutate(Oil_type = oil, Grouping = "Exp_Prefix", 
+               Exp_Prefix = exp_prefix, By = "Time", Variable = response_var)
+      results_1A[[exp_prefix]] <- stat_res
+    }
+  }
+  df_1A <- if (length(results_1A) > 0) bind_rows(results_1A) else data.frame()
+  
+  # ---- 1B: Exp_Label comparisons ----
+  results_1B <- list()
+  for (t in unique(oil_data$Time)) {
+    data_time <- oil_data %>% filter(Time == t)
+    if (n_distinct(data_time$Exp_Label) < 2) next
+    
+    stat_res <- run_pairwise(data_time, "Exp_Label", value_var = response_var, is_normal = is_normal)
+    if (!is.null(stat_res)) {
+      stat_res <- stat_res %>%
+        mutate(Oil_type = oil, Grouping = "Time", Time = t, By = "Exp_Label", Variable = response_var)
+      results_1B[[t]] <- stat_res
+    }
+  }
+  df_1B <- if (length(results_1B) > 0) bind_rows(results_1B) else data.frame()
+  
+  # ---- 2. Two-way ANOVA ----
+  anova_model <- aov(as.formula(paste(response_var, "~ Exp_Label * Time")), data = oil_data)
+  anova_summary <- summary(anova_model)
+  
+  tukey_exp_time <- tryCatch(TukeyHSD(anova_model), error = function(e) NULL)
+  tukey_table <- NULL
+  if (!is.null(tukey_exp_time)) {
+    tidy_df <- tryCatch(broom::tidy(tukey_exp_time$`Exp_Label:Time`), error = function(e) NULL)
+    if (!is.null(tidy_df) && nrow(tidy_df) > 0) {
+      comp_col <- intersect(c("contrast", "comparison"), names(tidy_df))
+      p_col    <- intersect(c("p.adj", "adj.p.value", "p.value"), names(tidy_df))
+      if (length(comp_col) > 0 && length(p_col) > 0) {
+        tukey_table <- tidy_df %>%
+          rename(Comparison = all_of(comp_col[1]), P_Value = all_of(p_col[1])) %>%
+          mutate(Oil_type = oil, Variable = response_var)
+      }
+    }
+  }
+  
+  # ---- 3. Pairwise Exp_Label × Time ----
+  oil_data <- oil_data %>% mutate(ExpTime = interaction(Exp_Label, Time, sep = "_"))
+  
+  pairwise_interaction <- tryCatch(
+    oil_data %>% rstatix::pairwise_t_test(as.formula(paste(response_var, "~ ExpTime")), 
+                                          p.adjust.method = "bonferroni"),
+    error = function(e) NULL
+  )
+  
+  # ---- Save results ----
+  all_results[[paste(oil, response_var, sep = "_")]] <- list(
+    Normality_Test        = shapiro_per_group,
+    Normality_Summary     = shapiro_summary,
+    Time_within_ExpPrefix = df_1A,
+    ExpLabel_at_Time      = df_1B,
+    ANOVA_model           = anova_summary,
+    TukeyHSD_ExpTime      = tukey_table,
+    Pairwise_ExpTime      = pairwise_interaction
+  )
+  
+  # Save CSVs
+  write.csv(shapiro_per_group, paste0("Oil_", oil, "_", response_var, "_Normality.csv"), row.names = FALSE)
+  if (nrow(df_1A) > 0) write.csv(df_1A, paste0("Oil_", oil, "_", response_var, "_TimeWithinExpPrefix.csv"), row.names = FALSE)
+  if (nrow(df_1B) > 0) write.csv(df_1B, paste0("Oil_", oil, "_", response_var, "_ExpLabelAtTime.csv"), row.names = FALSE)
+  if (!is.null(tukey_table) && nrow(tukey_table) > 0) write.csv(tukey_table, paste0("Oil_", oil, "_", response_var, "_TukeyHSD.csv"), row.names = FALSE)
+  if (!is.null(pairwise_interaction) && nrow(pairwise_interaction) > 0) write.csv(pairwise_interaction, paste0("Oil_", oil, "_", response_var, "_Pairwise.csv"), row.names = FALSE)
+}
+
+# ---- Save summaries ----
+saveRDS(all_results, paste0("all_oil_results_", response_var, ".RDS"))
+write.csv(normality_results, paste0("All_Oils_", response_var, "_Normality_Summary.csv"), row.names = FALSE)
+
+cat("\n========================================\n")
+cat("Analysis Complete for:", response_var, "\n")
+cat("========================================\n")
+print(normality_results)
+
